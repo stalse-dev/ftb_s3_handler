@@ -1,13 +1,22 @@
-import os
-from typing import Any, Optional
+import concurrent
+from concurrent.futures.thread import ThreadPoolExecutor
 
-from dotenv import load_dotenv
+import polars as pl
+import json
+import logging
 import boto3
+from typing import Any, Optional
+from dotenv import load_dotenv
 from botocore.client import BaseClient
 from botocore.paginate import PageIterator
 from io import BytesIO
-import polars as pl
-import json
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(name)s - %(levelname)s - %(message)s'
+)
+
+logger = logging.getLogger(__name__)
 
 class S3ClientModule:
     _s3_client = None
@@ -18,7 +27,7 @@ class S3ClientModule:
     def get_client(cls,
                    aws_access_key_id: Optional[str] = None,
                    aws_secret_access_key: Optional[str] = None) -> BaseClient:
-        if access_key_id and secret_access_key:
+        if aws_access_key_id and aws_secret_access_key:
             session = boto3.session.Session()
             cls._s3_client = session.client(
                 "s3",
@@ -52,27 +61,63 @@ class S3Handler:
         paginator = s3_client.get_paginator('list_objects_v2')
         return paginator.paginate(Bucket=self._bucket, Prefix=self._path)
 
-    def _get_object_content(self) -> BytesIO:
+    def _get_object_content(self, file_key: str) -> BytesIO:
         s3_client = S3ClientModule.get_client()
-        response = s3_client.get_object(Bucket=self._bucket, Key=self._path)
+        response = s3_client.get_object(Bucket=self._bucket, Key=file_key)
         content = response["Body"].read()
         return BytesIO(content)
 
     def handle_in_bucket_path(self) -> str:
         pages = self._get_objects()
+        logger.info(f"Retrieved all objects in bucket {self._bucket}")
 
         for page in pages:
             if 'Contents' in page:
                 for obj in page['Contents']:
                     file_key = obj['Key']
+
+                    if file_key.endswith('/'):
+                        logger.warning("{0} é um diretório, pulando".format(file_key))
+                        continue
+
+                    if not file_key.endswith('.parquet'):
+                        logger.warning("{0} não é um parquet, pulando".format(file_key))
+                        continue
+
+                    file_extension = file_key.split('.')[-1].lower()
+                    if file_extension == 'csv':
+                        logger.warning("{0} já um csv, pulando".format(file_key))
+                        continue
+
                     file_key_csv = file_key.replace('.parquet', '.csv')
 
-                    print(file_key)
+                    logger.info(f"Processando: {file_key} -> {file_key_csv}")
 
-                    # content: BytesIO = self._get_object_content()
-                    # df: pl.DataFrame = pl.read_parquet(content, use_pyarrow=True)
-                    # df.write_csv("s3://{0}/{1}".format(self._bucket, file_key_csv),
-                    #              storage_options=S3ClientModule.get_storage_options())
+                    try:
+                        content: BytesIO = self._get_object_content(file_key)
+                        df: pl.DataFrame = pl.read_parquet(content, use_pyarrow=True)
+
+                        df.write_csv(
+                            f"s3://{self._bucket}/{file_key_csv}",
+                            storage_options=S3ClientModule.get_storage_options()
+                        )
+
+                        logger.info(f"Convertido com sucesso: {file_key} -> {file_key_csv}")
+
+                    except Exception as e:
+                        logger.error(f"Ocorreu um erro ao processar {file_key}: {str(e)}")
+                        continue
+
+
+def process_bucket_path(bucket_name: str,
+                        path: str,
+                        aws_access_key_id: str,
+                        aws_secret_access_key: str) -> str:
+    S3ClientModule.get_client(aws_access_key_id=aws_access_key_id,
+                              aws_secret_access_key=aws_secret_access_key)
+
+    handler = S3Handler(bucket_name, path)
+    return handler.handle_in_bucket_path()
 
 if __name__ == "__main__":
 
@@ -89,10 +134,20 @@ if __name__ == "__main__":
         secret_access_key = bucket["secret_access_key"]
         paths = bucket["paths"]
 
-        # inicializando client
-        S3ClientModule.get_client(aws_access_key_id=access_key_id,
-                                  aws_secret_access_key=secret_access_key)
+        logger.info(f"Processing bucket {name}")
 
-        for path in paths:
-            handler = S3Handler(name, path)
-            handler.handle_in_bucket_path()
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            # enviando todas as tasks e salvando em um dict
+            future_to_path = {
+                executor.submit(process_bucket_path, name, path, access_key_id, secret_access_key): path
+                for path in paths
+            }
+
+            # esperando tasks completarem para mostrar o feedback [path por path]
+            for future in concurrent.futures.as_completed(future_to_path):
+                path = future_to_path[future]
+                try:
+                    result = future.result()
+                    logger.info(f"Finalizado {path}")
+                except Exception as exc:
+                    logger.error(f"Ocorreu um erro ao processar path: {exc}")

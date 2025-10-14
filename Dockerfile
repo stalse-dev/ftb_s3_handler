@@ -1,0 +1,26 @@
+FROM python:3.10.18-bullseye AS builder
+
+WORKDIR /usr/app
+
+RUN pip install poetry
+
+COPY pyproject.toml poetry.lock README.md ./
+COPY ftb_s3_handler/ ./ftb_s3_handler/
+
+RUN poetry config virtualenvs.in-project true && \
+  poetry install --only main
+
+FROM python:3.10.18-slim-bullseye
+
+WORKDIR /usr/app
+
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+COPY --from=builder /usr/app/.venv ./.venv
+COPY ftb_s3_handler/ ./ftb_s3_handler/
+COPY schema.json ./schema.json
+
+ENV PATH="/usr/app/.venv/bin:$PATH"
+
+CMD ["python", "-m", "ftb_s3_handler.main"]
