@@ -1,6 +1,4 @@
 import concurrent
-from concurrent.futures.thread import ThreadPoolExecutor
-
 import polars as pl
 import json
 import logging
@@ -9,7 +7,11 @@ from typing import Any, Optional
 from dotenv import load_dotenv
 from botocore.client import BaseClient
 from botocore.paginate import PageIterator
+from botocore.exceptions import ClientError
 from io import BytesIO
+from concurrent.futures.thread import ThreadPoolExecutor
+
+from ftb_s3_handler.utils import handle_nested_data
 
 logging.basicConfig(
     level=logging.INFO,
@@ -56,6 +58,17 @@ class S3Handler:
         self._bucket = bucket
         self._path = path
 
+    def object_already_exists(self, file_key: str) -> bool:
+        s3_client = S3ClientModule.get_client()
+        try:
+            s3_client.get_object(Bucket=self._bucket, Key=file_key)
+        # se nenhum ãrquivo foi encontrado ele levanta o erro NoSuchKey
+        # que pode ser capturado usando isso
+        except ClientError:
+            return False
+
+        return True
+
     def _get_objects(self) -> PageIterator:
         s3_client = S3ClientModule.get_client()
         paginator = s3_client.get_paginator('list_objects_v2')
@@ -67,9 +80,17 @@ class S3Handler:
         content = response["Body"].read()
         return BytesIO(content)
 
-    def handle_in_bucket_path(self) -> str:
+    def _save_in_path(self, df: pl.DataFrame, file_key_csv: str) -> None:
+        df = handle_nested_data(df)
+
+        df.write_csv(
+            f"s3://{self._bucket}/{file_key_csv}",
+            storage_options=S3ClientModule.get_storage_options()
+        )
+
+    def execute(self):
         pages = self._get_objects()
-        logger.info(f"Retrieved all objects in bucket {self._bucket}")
+        logger.info(f"Retrieved objects in bucket {self._bucket} path {self._path}")
 
         for page in pages:
             if 'Contents' in page:
@@ -77,47 +98,56 @@ class S3Handler:
                     file_key = obj['Key']
 
                     if file_key.endswith('/'):
-                        logger.warning("{0} é um diretório, pulando".format(file_key))
+                        logger.warning(
+                            "{0} é um diretório, pulando".format(file_key))
                         continue
 
                     if not file_key.endswith('.parquet'):
-                        logger.warning("{0} não é um parquet, pulando".format(file_key))
+                        logger.warning(
+                            "{0} não é um parquet, pulando".format(file_key))
                         continue
 
                     file_extension = file_key.split('.')[-1].lower()
                     if file_extension == 'csv':
-                        logger.warning("{0} já um csv, pulando".format(file_key))
+                        logger.warning(
+                            "{0} já um csv, pulando".format(file_key))
                         continue
 
                     file_key_csv = file_key.replace('.parquet', '.csv')
+
+                    # if self.object_already_exists(file_key_csv):
+                    #     logger.warning(
+                    #         "{0} conversão para csv já existe, pulando".format(file_key_csv))
+                    #     continue
 
                     logger.info(f"Processando: {file_key} -> {file_key_csv}")
 
                     try:
                         content: BytesIO = self._get_object_content(file_key)
-                        df: pl.DataFrame = pl.read_parquet(content, use_pyarrow=True)
+                        df: pl.DataFrame = pl.read_parquet(
+                            content, use_pyarrow=True)
 
-                        df.write_csv(
-                            f"s3://{self._bucket}/{file_key_csv}",
-                            storage_options=S3ClientModule.get_storage_options()
-                        )
+                        self._save_in_path(df=df, file_key_csv=file_key_csv)
 
-                        logger.info(f"Convertido com sucesso: {file_key} -> {file_key_csv}")
+                        logger.info(
+                            f"Convertido com sucesso: {file_key} -> {file_key_csv}")
 
                     except Exception as e:
-                        logger.error(f"Ocorreu um erro ao processar {file_key}: {str(e)}")
+                        logger.error(
+                            f"Ocorreu um erro ao processar {file_key}: {str(e)}")
                         continue
 
 
 def process_bucket_path(bucket_name: str,
                         path: str,
                         aws_access_key_id: str,
-                        aws_secret_access_key: str) -> str:
+                        aws_secret_access_key: str):
     S3ClientModule.get_client(aws_access_key_id=aws_access_key_id,
                               aws_secret_access_key=aws_secret_access_key)
 
     handler = S3Handler(bucket_name, path)
-    return handler.handle_in_bucket_path()
+    handler.execute()
+
 
 if __name__ == "__main__":
 
