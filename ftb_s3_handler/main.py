@@ -1,16 +1,17 @@
 import concurrent
+import os
+import sys
+from typing import Optional, Literal
+
 import polars as pl
-import json
 import logging
-import boto3
-from typing import Any, Optional
 from dotenv import load_dotenv
-from botocore.client import BaseClient
 from botocore.paginate import PageIterator
 from botocore.exceptions import ClientError
 from io import BytesIO
 from concurrent.futures.thread import ThreadPoolExecutor
-
+from threading import Lock, Event
+from ftb_s3_handler.s3_client import S3Client
 from ftb_s3_handler.utils import handle_nested_data
 
 logging.basicConfig(
@@ -20,48 +21,32 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-class S3ClientModule:
-    _s3_client = None
-    _access_key_id = None
-    _secret_access_key = None
-
-    @classmethod
-    def get_client(cls,
-                   aws_access_key_id: Optional[str] = None,
-                   aws_secret_access_key: Optional[str] = None) -> BaseClient:
-        if aws_access_key_id and aws_secret_access_key:
-            session = boto3.session.Session()
-            cls._s3_client = session.client(
-                "s3",
-                aws_access_key_id=aws_access_key_id,
-                aws_secret_access_key=aws_secret_access_key,
-            )
-            cls._access_key_id = aws_access_key_id
-            cls._secret_access_key = aws_secret_access_key
-
-        return cls._s3_client
-
-    @classmethod
-    def get_storage_options(cls) -> dict[str, str | None | Any]:
-        return {
-            "aws_access_key_id": cls._access_key_id,
-            "aws_secret_access_key": cls._secret_access_key,
-            "aws_region": cls._s3_client.meta.region_name
-        }
-
-
 class S3Handler:
-    _bucket = None
-    _path = None
+    _bucket: str = None
+    _path: str = None
+    _file_count: int = None
+    _file_count_lock: Lock = None
+    _file_limit: int = None
+    _shutdown_event = None
+    _s3_client: S3Client = None
+    _s3_client_session = None
 
-    def __init__(self, bucket: str, path: str) -> None:
+    def __init__(self, bucket: str, path: str, file_limit: int = 0) -> None:
         self._bucket = bucket
         self._path = path
+        self._file_count = 0
+        # lock count para thread safe
+        # evitar race condition na contagem
+        # de arquivos
+        self._file_count_lock = Lock()
+        self._file_limit = file_limit
+        self._shutdown_event = Event()
+        self._s3_client = S3Client()
+        self._s3_client_session = self._s3_client.get_s3_client()
 
     def object_already_exists(self, file_key: str) -> bool:
-        s3_client = S3ClientModule.get_client()
         try:
-            s3_client.get_object(Bucket=self._bucket, Key=file_key)
+            self._s3_client_session.get_object(Bucket=self._bucket, Key=file_key)
         # se nenhum ãrquivo foi encontrado ele levanta o erro NoSuchKey
         # que pode ser capturado usando isso
         except ClientError:
@@ -69,14 +54,17 @@ class S3Handler:
 
         return True
 
+    def _increment_file_count(self) -> int:
+        with self._file_count_lock:
+            self._file_count += 1
+            return self._file_count
+
     def _get_objects(self) -> PageIterator:
-        s3_client = S3ClientModule.get_client()
-        paginator = s3_client.get_paginator('list_objects_v2')
+        paginator = self._s3_client_session.get_paginator('list_objects_v2')
         return paginator.paginate(Bucket=self._bucket, Prefix=self._path)
 
     def _get_object_content(self, file_key: str) -> BytesIO:
-        s3_client = S3ClientModule.get_client()
-        response = s3_client.get_object(Bucket=self._bucket, Key=file_key)
+        response = self._s3_client_session.get_object(Bucket=self._bucket, Key=file_key)
         content = response["Body"].read()
         return BytesIO(content)
 
@@ -85,67 +73,68 @@ class S3Handler:
 
         df.write_csv(
             f"s3://{self._bucket}/{file_key_csv}",
-            storage_options=S3ClientModule.get_storage_options()
+            storage_options=self._s3_client.get_storage_options()
         )
 
     def execute(self):
         pages = self._get_objects()
-        logger.info(f"Retrieved objects in bucket {self._bucket} path {self._path}")
+        max_workers_process_file = int(os.environ.get('MAX_WORKERS', '2'))
+
+        logger.info(
+            f"Retrieved objects in bucket {self._bucket} path {self._path}")
+
+        def _process_file(obj) -> Optional[str]:
+            file_key = obj['Key']
+
+            if file_key.endswith('/'):
+                logger.warning(
+                    "{0} é um diretório, pulando".format(file_key))
+                return None
+
+            file_key_csv = file_key.replace('.parquet', '.csv')
+
+            if self.object_already_exists(file_key_csv):
+                logger.warning(
+                    "{0} conversão para csv já existe, pulando".format(file_key_csv))
+                return None
+
+            logger.info(f"Processando: {file_key} -> {file_key_csv}")
+
+            try:
+                content: BytesIO = self._get_object_content(file_key)
+                df: pl.DataFrame = pl.read_parquet(
+                    content, use_pyarrow=True)
+
+                self._save_in_path(df=df, file_key_csv=file_key_csv)
+                file_count = self._increment_file_count()
+
+                logger.info(
+                    f"Convertido com sucesso: {file_key} -> {file_key_csv}")
+
+                # Check file limit with thread-safe approach
+                # if file_count >= self._file_limit != 0:
+                #     logger.warning(
+                #         "Limite de arquivos alcançado")
+                #     sys.exit(0)
+
+            except Exception as e:
+                logger.error(
+                    f"Ocorreu um erro ao processar {file_key}: {str(e)}")
+                return None
 
         for page in pages:
             if 'Contents' in page:
-                for obj in page['Contents']:
-                    file_key = obj['Key']
+                with ThreadPoolExecutor(max_workers=max_workers_process_file) as _process_file_executor:
+                    futures = [_process_file_executor.submit(_process_file, obj) for obj in page['Contents']]
 
-                    if file_key.endswith('/'):
-                        logger.warning(
-                            "{0} é um diretório, pulando".format(file_key))
-                        continue
-
-                    if not file_key.endswith('.parquet'):
-                        logger.warning(
-                            "{0} não é um parquet, pulando".format(file_key))
-                        continue
-
-                    file_extension = file_key.split('.')[-1].lower()
-                    if file_extension == 'csv':
-                        logger.warning(
-                            "{0} já um csv, pulando".format(file_key))
-                        continue
-
-                    file_key_csv = file_key.replace('.parquet', '.csv')
-
-                    # if self.object_already_exists(file_key_csv):
-                    #     logger.warning(
-                    #         "{0} conversão para csv já existe, pulando".format(file_key_csv))
-                    #     continue
-
-                    logger.info(f"Processando: {file_key} -> {file_key_csv}")
-
-                    try:
-                        content: BytesIO = self._get_object_content(file_key)
-                        df: pl.DataFrame = pl.read_parquet(
-                            content, use_pyarrow=True)
-
-                        self._save_in_path(df=df, file_key_csv=file_key_csv)
-
-                        logger.info(
-                            f"Convertido com sucesso: {file_key} -> {file_key_csv}")
-
-                    except Exception as e:
-                        logger.error(
-                            f"Ocorreu um erro ao processar {file_key}: {str(e)}")
-                        continue
+                    for _process_file_future in concurrent.futures.as_completed(futures):
+                        _process_file_result = future.result()
 
 
-def process_bucket_path(bucket_name: str,
-                        path: str,
-                        aws_access_key_id: str,
-                        aws_secret_access_key: str):
-    S3ClientModule.get_client(aws_access_key_id=aws_access_key_id,
-                              aws_secret_access_key=aws_secret_access_key)
+def process_bucket_path(bucket: str, path: str):
+    file_limit = int(os.environ.get('FILE_LIMIT', '0'))
 
-    handler = S3Handler(bucket_name, path)
+    handler = S3Handler(bucket, path, file_limit=file_limit)
     handler.execute()
 
 
@@ -153,31 +142,43 @@ if __name__ == "__main__":
 
     load_dotenv()
 
-    schema = json.load(open("schema.json", 'r'))
+    bucket_name = os.environ.get("S3_BUCKET")
+    paths = [
+        "api-project-1033684201634/analytics_153835980/events/2025/08",
+        "api-project-1033684201634/analytics_153835980/events/2025/09",
+        "api-project-1033684201634/analytics_153835980/events/2025/10",
+        "appcues/2025/08",
+        "appcues/2025/09",
+        "appcues/2025/10",
+        "airship/channels/2025/08",
+        "airship/channels/2025/09",
+        "airship/channels/2025/10",
+        "blip/all_contacts_threads/2025/08",
+        "blip/all_contacts_threads/2025/09",
+        "blip/all_contacts_threads/2025/10",
+        "blip_v2/full_tickets/2025/08",
+        "blip_v2/full_tickets/2025/09",
+        "blip_v2/full_tickets/2025/10",
+        "blip_v2/all_contacts_threads/2025/08",
+        "blip_v2/all_contacts_threads/2025/09",
+        "blip_v2/all_contacts_threads/2025/10"
+      ]
 
-    buckets = schema["buckets"]
+    max_workers = int(os.environ.get('MAX_WORKERS', '2'))
 
-    for bucket in buckets:
+    logger.info(f"Processing bucket {bucket_name}")
 
-        name = bucket["name"]
-        access_key_id = bucket["access_key_id"]
-        secret_access_key = bucket["secret_access_key"]
-        paths = bucket["paths"]
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # enviando todas as tasks e salvando em um dict
+        future_to_path = {
+            executor.submit(process_bucket_path, bucket_name, path): path
+            for path in paths
+        }
 
-        logger.info(f"Processing bucket {name}")
-
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            # enviando todas as tasks e salvando em um dict
-            future_to_path = {
-                executor.submit(process_bucket_path, name, path, access_key_id, secret_access_key): path
-                for path in paths
-            }
-
-            # esperando tasks completarem para mostrar o feedback [path por path]
-            for future in concurrent.futures.as_completed(future_to_path):
-                path = future_to_path[future]
-                try:
-                    result = future.result()
-                    logger.info(f"Finalizado {path}")
-                except Exception as exc:
-                    logger.error(f"Ocorreu um erro ao processar path: {exc}")
+        # esperando tasks completarem para mostrar o feedback [path por path]
+        for future in concurrent.futures.as_completed(future_to_path):
+            path = future_to_path[future]
+            try:
+                result = future.result()
+            except Exception as exc:
+                logger.error(f"Ocorreu um erro ao processar path: {exc}")

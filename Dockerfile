@@ -19,7 +19,6 @@ ENV PYTHONDONTWRITEBYTECODE=1
 
 COPY --from=builder /usr/app/.venv ./.venv
 COPY ftb_s3_handler/ ./ftb_s3_handler/
-COPY schema.json ./schema.json
 
 ENV PATH="/usr/app/.venv/bin:$PATH"
 
