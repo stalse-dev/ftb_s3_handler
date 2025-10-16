@@ -106,6 +106,7 @@ class S3Handler:
                     content, use_pyarrow=True)
 
                 self._save_in_path(df=df, file_key_csv=file_key_csv)
+
                 file_count = self._increment_file_count()
 
                 logger.info(
@@ -143,27 +144,7 @@ if __name__ == "__main__":
     load_dotenv()
 
     bucket_name = os.environ.get("S3_BUCKET")
-    paths = [
-        "api-project-1033684201634/analytics_153835980/events/2025/08",
-        "api-project-1033684201634/analytics_153835980/events/2025/09",
-        "api-project-1033684201634/analytics_153835980/events/2025/10",
-        "appcues/2025/08",
-        "appcues/2025/09",
-        "appcues/2025/10",
-        "airship/channels/2025/08",
-        "airship/channels/2025/09",
-        "airship/channels/2025/10",
-        "blip/all_contacts_threads/2025/08",
-        "blip/all_contacts_threads/2025/09",
-        "blip/all_contacts_threads/2025/10",
-        "blip_v2/full_tickets/2025/08",
-        "blip_v2/full_tickets/2025/09",
-        "blip_v2/full_tickets/2025/10",
-        "blip_v2/all_contacts_threads/2025/08",
-        "blip_v2/all_contacts_threads/2025/09",
-        "blip_v2/all_contacts_threads/2025/10"
-      ]
-
+    paths = os.environ.get("S3_PATHS").split(";")
     max_workers = int(os.environ.get('MAX_WORKERS', '2'))
 
     logger.info(f"Processing bucket {bucket_name}")
