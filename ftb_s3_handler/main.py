@@ -1,10 +1,9 @@
 import concurrent
 import os
-import sys
-from typing import Optional, Literal
-
+import gc
 import polars as pl
 import logging
+from typing import Optional
 from dotenv import load_dotenv
 from botocore.paginate import PageIterator
 from botocore.exceptions import ClientError
@@ -12,7 +11,7 @@ from io import BytesIO
 from concurrent.futures.thread import ThreadPoolExecutor
 from threading import Lock, Event
 from ftb_s3_handler.s3_client import S3Client
-from ftb_s3_handler.utils import handle_nested_data
+from ftb_s3_handler.utils import handle_nested_data, ShutdownManager
 
 logging.basicConfig(
     level=logging.INFO,
@@ -27,7 +26,6 @@ class S3Handler:
     _file_count: int = None
     _file_count_lock: Lock = None
     _file_limit: int = None
-    _shutdown_event = None
     _s3_client: S3Client = None
     _s3_client_session = None
 
@@ -38,7 +36,6 @@ class S3Handler:
         # lock count para thread safe
         # evitar race condition na contagem
         # de arquivos
-        self._file_count_lock = Lock()
         self._file_limit = file_limit
         self._shutdown_event = Event()
         self._s3_client = S3Client()
@@ -77,6 +74,11 @@ class S3Handler:
         )
 
     def execute(self):
+
+        # se o evento de shutdown foi requisitado, não execute mais nada
+        if ShutdownManager().shutdown_event.is_set():
+            return
+
         pages = self._get_objects()
         max_workers_process_file = int(os.environ.get('MAX_WORKERS', '2'))
 
@@ -107,16 +109,24 @@ class S3Handler:
 
                 self._save_in_path(df=df, file_key_csv=file_key_csv)
 
+                # limpando memória do dataframe
+                del df
+                del content
+
+                # forçando garbage collection
+                gc.collect()
+
                 file_count = self._increment_file_count()
 
                 logger.info(
                     f"Convertido com sucesso: {file_key} -> {file_key_csv}")
 
                 # Check file limit with thread-safe approach
-                # if file_count >= self._file_limit != 0:
-                #     logger.warning(
-                #         "Limite de arquivos alcançado")
-                #     sys.exit(0)
+                if file_count >= self._file_limit != 0:
+                    logger.warning(
+                        f"Limite de arquivos alcançado para o path: {self._path}")
+                    ShutdownManager().request_shutdown()
+                    return None
 
             except Exception as e:
                 logger.error(
@@ -124,13 +134,22 @@ class S3Handler:
                 return None
 
         for page in pages:
+
+            # se o evento de shutdown foi requisitado, não execute mais nada
+            if ShutdownManager().shutdown_event.is_set():
+                return
+
             if 'Contents' in page:
                 with ThreadPoolExecutor(max_workers=max_workers_process_file) as _process_file_executor:
-                    futures = [_process_file_executor.submit(_process_file, obj) for obj in page['Contents']]
+                    process_file_futures = [_process_file_executor.submit(_process_file, obj) for obj in page['Contents']]
 
-                    for _process_file_future in concurrent.futures.as_completed(futures):
-                        _process_file_result = future.result()
-
+                    for process_file_future in concurrent.futures.as_completed(process_file_futures):
+                        if ShutdownManager().shutdown_event.is_set():
+                            logger.info("Parando execução do programa e cancelando tasks pendentes")
+                            for f in process_file_futures:
+                                f.cancel()
+                            break
+                        process_file_future.result()
 
 def process_bucket_path(bucket: str, path: str):
     file_limit = int(os.environ.get('FILE_LIMIT', '0'))
@@ -159,6 +178,12 @@ if __name__ == "__main__":
         # esperando tasks completarem para mostrar o feedback [path por path]
         for future in concurrent.futures.as_completed(future_to_path):
             path = future_to_path[future]
+
+            if ShutdownManager().shutdown_event.is_set():
+                logger.info("Parando o executor principal")
+                executor.shutdown(wait=False, cancel_futures=True)
+                break
+
             try:
                 result = future.result()
             except Exception as exc:

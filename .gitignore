@@ -211,3 +211,5 @@ schema.json.bkp
 testes.py
 
 .idea
+
+*.csv
