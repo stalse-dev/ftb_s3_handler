@@ -36,8 +36,8 @@ class S3Handler:
         # lock count para thread safe
         # evitar race condition na contagem
         # de arquivos
+        self._file_count_lock= Lock()
         self._file_limit = file_limit
-        self._shutdown_event = Event()
         self._s3_client = S3Client()
         self._s3_client_session = self._s3_client.get_s3_client()
 
