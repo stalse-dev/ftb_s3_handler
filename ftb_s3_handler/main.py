@@ -9,7 +9,7 @@ from botocore.paginate import PageIterator
 from botocore.exceptions import ClientError
 from io import BytesIO
 from concurrent.futures.thread import ThreadPoolExecutor
-from threading import Lock, Event
+from threading import Lock
 from ftb_s3_handler.s3_client import S3Client
 from ftb_s3_handler.utils import handle_nested_data, ShutdownManager
 
