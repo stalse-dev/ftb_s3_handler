@@ -21,10 +21,11 @@ if __name__ == "__main__":
 
         year = blob.name.split("_")[1]
         content = blob.download_as_bytes()
+        key = "api-project-1033684201634/analytics_153835980/events/{0}/12/31/{1}".format(year, blob.name)
 
         s3_client.put_object(
             Bucket="gcp-bigquery-stalse-landing",
-            Key="api-project-1033684201634/analytics_153835980/events/teste/teste.csv",
+            Key=key,
             Body=content,
         )
 
