@@ -22,4 +22,4 @@ COPY ftb_s3_handler/ ./ftb_s3_handler/
 
 ENV PATH="/usr/app/.venv/bin:$PATH"
 
-CMD ["python", "-m", "ftb_s3_handler.gcs_to_s3.py"]
+CMD ["python", "-m", "ftb_s3_handler.gcs_to_s3"]
