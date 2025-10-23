@@ -36,7 +36,7 @@ if __name__ == "__main__":
             s3_client.get_object(Bucket=s3_bucket, Key=key)
             # se não der erro significa que o objeto existe e portanto não nos interessa
             # fazer o download e reenviar
-            logger.info("Já existe no destino, pulando {0}/{1}".format(bucket_id, blob.name))
+            logger.info("Já existe no destino, pulando {0}/{1}".format(s3_bucket, key))
             continue
 
         except ClientError:
