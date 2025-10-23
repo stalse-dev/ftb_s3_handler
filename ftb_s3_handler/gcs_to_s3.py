@@ -2,6 +2,8 @@
 import logging
 import os
 import gc
+
+from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 from google.cloud.storage import Bucket
 
@@ -28,11 +30,21 @@ if __name__ == "__main__":
     blobs = bucket.list_blobs()
 
     for blob in blobs:
+        key = s3_landing.format(blob.name)
+
+        try:
+            s3_client.get_object(Bucket=s3_bucket, Key=key)
+            # se não der erro significa que o objeto existe e portanto não nos interessa
+            # fazer o download e reenviar
+            logger.info("Já existe no destino, pulando {0}/{1}".format(bucket_id, blob.name))
+            continue
+
+        except ClientError:
+            pass
 
         logger.info("Downloading {0}/{1}".format(bucket_id, blob.name))
 
         content = blob.download_as_bytes()
-        key = s3_landing.format(blob.name)
 
         logger.info("Sending {0}/{1} to {2}/{3}".format(bucket_id, blob.name, s3_bucket, key))
 
